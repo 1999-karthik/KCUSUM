@@ -1,0 +1,171 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from fitter import Fitter, get_common_distributions
+from scipy.stats import distributions
+
+
+
+#preprocessing the data , splitting into suitable x ,y,z cords and processing it 
+class XYZProcessor:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.x_coords = None
+        self.y_coords = None
+        self.z_coords = None
+    
+    def read_xyz(self):
+        with open(self.file_path, 'r') as file:
+            lines = file.readlines()
+        
+        num_atoms = int(lines[0].strip())
+        num_frames = len(lines) // (num_atoms + 2)
+        
+        x_coords = []
+        y_coords = []
+        z_coords = []
+        
+        for frame in range(num_frames):
+            start_index = frame * (num_atoms + 2) + 2
+            for i in range(start_index, start_index + num_atoms):
+                parts = lines[i].split()
+                x_coords.append(float(parts[1]))
+                y_coords.append(float(parts[2]))
+                z_coords.append(float(parts[3]))
+        
+        self.x_coords = np.array(x_coords).reshape((num_frames, num_atoms))
+        self.y_coords = np.array(y_coords).reshape((num_frames, num_atoms))
+        self.z_coords = np.array(z_coords).reshape((num_frames, num_atoms))
+    
+    def save_coordinates(self, x_file, y_file, z_file):
+        np.savetxt(x_file, self.x_coords, delimiter=",")
+        np.savetxt(y_file, self.y_coords, delimiter=",")
+        np.savetxt(z_file, self.z_coords, delimiter=",")
+    
+    def compute_means(self):
+        mean_x = np.mean(self.x_coords, axis=1)
+        mean_y = np.mean(self.y_coords, axis=1)
+        mean_z = np.mean(self.z_coords, axis=1)
+        
+        mean_df = pd.DataFrame({
+            'mean_x': mean_x,
+            'mean_y': mean_y,
+            'mean_z': mean_z
+        })
+        
+        return mean_df
+
+#finding out dynamic fitter distribution
+class DistributionFitter:
+    def __init__(self, data):
+        self.data = data
+    
+    def fit_distribution(self):
+        f = Fitter(self.data, distributions=get_common_distributions())
+        f.fit()
+        best_distribution = f.get_best(method='sumsquare_error')
+        return best_distribution
+    
+    def summarize(self):
+        f = Fitter(self.data, distributions=get_common_distributions())
+        f.fit()
+        f.summary()
+
+
+#refrence generation for KCUSUM
+def generate_random_samples(dist_name, params, size):
+
+    dist = getattr(distributions, dist_name)  
+    loc = params.get('loc', 0)
+    scale = params.get('scale', 1)
+    args = [params[key] for key in params if key not in ['loc', 'scale']]
+    return dist.rvs(*args, loc=loc, scale=scale, size=size)
+
+
+#core KCUSUM with all methods and class level implementation
+
+class KCUSUMDetector:
+    def __init__(self, threshold, delta):
+        self.h = threshold
+        self.delta = delta
+
+    @staticmethod
+    def gk(x, y):
+        return np.exp(-((x - y) ** 2) / 2.0)
+
+    def mmd(self, x_n_1, x_n, y_n_1, y_n):
+        xx = self.gk(x_n_1, x_n)
+        yy = self.gk(y_n_1, y_n)
+        xy = self.gk(x_n_1, y_n)
+        yx = self.gk(x_n, y_n_1)
+        return xx + yy - xy - yx
+
+    def run(self, x_1, x_2, yz_1, yz_2):
+        T_kcusum = 0
+        Z_n = 0
+        stat_values = []
+        index_1 = []
+
+        for i in np.arange(2, len(x_1), 2):
+            av_n = self.mmd(x_1[i], x_2[i - 1], yz_1[i], yz_2[i - 1])
+            c_n = av_n - self.delta
+            Z_n += c_n
+            stat_values.append(Z_n)
+
+            if Z_n < 0:
+                Z_n = 0
+
+            if Z_n > self.h:
+                T_kcusum = i
+                break
+
+        index_1 = np.arange(2, 2 * len(stat_values) + 1, 2)
+        plt.plot(index_1, stat_values)
+        plt.axhline(self.h, color='r', linestyle='-')
+        plt.ylabel('Threshold Value (Z_n)')
+        plt.xlabel('Time')
+        plt.xticks(fontsize=8)
+        plt.scatter(index_1[-1], self.h)
+        plt.text(index_1[-1], self.h, 'CP Detected', horizontalalignment='right')
+        plt.show()
+
+        return T_kcusum
+
+
+# Main function to tie everything together
+def main(file_path):
+    # Initialize and process the XYZ file
+    xyz_processor = XYZProcessor(file_path)
+    xyz_processor.read_xyz()
+    
+    # Save coordinates
+    xyz_processor.save_coordinates("x_coords.csv", "y_coords.csv", "z_coords.csv")
+    
+    # Computation mean values
+    mean_df = xyz_processor.compute_means()
+    mean_df.to_csv("mean_values.csv", index=False)
+    
+    # Fit distributions
+    dist_fitter_x = DistributionFitter(mean_df['mean_x'])
+    dist_fitter_y = DistributionFitter(mean_df['mean_y'])
+    dist_fitter_z = DistributionFitter(mean_df['mean_z'])
+    
+    best_distribution_x = dist_fitter_x.fit_distribution()
+    best_distribution_y = dist_fitter_y.fit_distribution()
+    best_distribution_z = dist_fitter_z.fit_distribution()
+
+    dist_x_name, params_x = list(best_distribution_x.items())[0]
+    dist_y_name, params_y = list(best_distribution_y.items())[0]
+    dist_z_name, params_z = list(best_distribution_z.items())[0]
+
+    ref_data_x = generate_random_samples(dist_x_name, params_x, len(mean_df['mean_x']))
+    ref_data_y = generate_random_samples(dist_y_name, params_y, len(mean_df['mean_y']))
+    ref_data_z = generate_random_samples(dist_z_name, params_z, len(mean_df['mean_z']))
+
+    # KCUSUM detection using the dynamically generated reference data
+    detector = KCUSUMDetector(threshold=0.015, delta=0.1)
+    detector.run(mean_df['mean_z'], mean_df['mean_z'], ref_data_z, ref_data_z)
+
+
+# Run the dynamic version of the code
+main('/pscratch/sd/s/saik1999/NWCHEM/data/1h9t_traj.xyz')
